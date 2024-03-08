@@ -1,0 +1,321 @@
+---
+title: "Class06_Homework_6002_yc1222"
+author: "Youngmin Choi"
+format: 
+  html: 
+    self-contained: true
+---
+
+```{r setup}
+echo=TRUE
+message=FALSE
+warning= FALSE
+library(tidyverse)     # loads the tidyverse tools
+library(RPostgres)     # loads the database driver for PostgreSQL
+library(connections)   # helps RPostgres work with RStudio
+library(keyring)       # access to a local encrypted keychain for passwords
+```
+
+## I. Objective
+
+-   Asthma is a chronic lung disease caused by inflammation around airways, making it hard to breathe, with symptoms such as coughing, wheezing, and chest tightness.
+-   Asthma cannot be cured but it can be managed with the right treatment. (source: <https://www.who.int/news-room/fact-sheets/detail/asthma>)
+-   Therefore, taking care of patients with asthma is important as this relates to the management or prevention of symptoms.
+-   In this report, asthma patient data were analyzed by defining asthma patient population cohort and current care status of those patients, in order to evaluate plan for proper quality of care for asthma patients.
+
+## II. Dataset
+
+-   The dataset used for this analysis is the Synthea dataset, a synthetic electronic health records.
+
+```{r package loading and database connection}
+
+# Loading Synthea dataset
+con <- connection_open(RPostgres::Postgres(),
+          dbname = "syntheticMGUH",
+          host = "35.199.4.72",
+          user = "hids502_student",
+          password = key_get(service = "syntheticmguh", 
+                             username = "hids502_student"),
+          bigint = "numeric")
+```
+
+## III. Target Population Data Analysis
+
+#### 1) Patient Filter Criteria
+
+-   Patients with asthma diagnosis or screening.
+
+    -   From conditions table/description column: containing 'Asthma' or 'asthma'
+    -   From encounters table/reason description column: containing 'Asthma' or 'asthma'
+    -   From procedures table/description column: containing 'Asthma' or 'asthma'
+    -   From medications table/code: patients with history of asthma-related medications.
+
+-   Following is the SQL code to include patients meeting at least one of the aforementioned standard, using the UNION operator. For the purpose of this analysis, only patients with data in the year 2022 were included.
+
+-   A temporary table was created for analysis.
+
+```{sql connection=con}
+DROP TABLE IF EXISTS asthmaCohort
+```
+
+```{sql connection=con}
+  WITH asthma_cohort AS (
+  SELECT patient 
+  FROM conditions 
+  WHERE EXTRACT(YEAR FROM start) =2022
+  AND (description LIKE '%Asthma%' OR description LIKE '%asthma%')
+
+  UNION
+
+  SELECT patient
+  FROM encounters
+  WHERE EXTRACT(YEAR FROM start) =2022
+  AND (reasondescription LIKE '%Asthma%' OR reasondescription LIKE '%asthma%')
+
+  UNION
+
+  SELECT patient
+  FROM procedures
+  WHERE EXTRACT(YEAR FROM start) =2022
+  AND (reasondescription LIKE '%Asthma%' OR reasondescription LIKE '%asthma%')
+  
+  UNION
+  
+  SELECT DISTINCT patient
+  FROM medications
+  WHERE code IN (95996, 349094, 616830, 1998774, 896209, 896006, 966529, 746815, 966524, 1547660, 1998772, 1536144, 630208, 859088, 745752, 351137, 351136, 245314, 2123111, 746763)
+  )
+ SELECT * INTO TEMP asthmaCohort FROM asthma_cohort
+ 
+```
+
+-   Confirm if the temporary table has been created successfully.
+
+```{sql connection=con}
+  SELECT * FROM asthmaCohort LIMIT 5
+```
+
+-   Confirmed if number of data (rows) matches the number of unique (distinct) patients in year 2022.\
+-   Total number of patients in the asthma cohort is 2298.
+
+```{sql connection=con}
+  SELECT COUNT(*) AS rows, COUNT(DISTINCT patient) FROM asthmaCohort 
+```
+
+#### 2) Patient Demographics
+
+**Overall Information**
+
+-   Following is the average age, and gender ratio information of the asthma cohort patient group.
+
+```{sql connection=con}
+SELECT CAST(AVG(EXTRACT(year FROM AGE('2022-12-31', CAST(p.birthdate AS DATE)))) AS INT) AS average_age, 
+(SUM(CASE WHEN p.gender='M' THEN 1 ELSE 0 END)*100)/(SELECT COUNT(*) FROM asthmaCohort) AS male_patient_ratio,
+(SUM(CASE WHEN p.gender='F' THEN 1 ELSE 0 END)*100)/(SELECT COUNT(*) FROM asthmaCohort) AS female_patient_ratio 
+FROM patients AS p
+WHERE p.id IN (SELECT patient FROM asthmaCohort)
+
+```
+
+**Race Information**
+
+-   Patient's race distribution with average age are described in the following query.
+
+```{sql connection=con}
+SELECT p.race, p.gender AS gender, COUNT(*) AS number_of_patient,  ((COUNT(*)*100)/(SELECT COUNT(*) FROM asthmaCohort)) AS percentage 
+FROM patients AS p
+INNER JOIN 
+asthmaCohort AS a
+ON a.patient=p.id
+WHERE p.deathdate IS NULL
+GROUP BY p.race, ROLLUP(p.gender)
+ORDER BY 
+ (SELECT COUNT(*) FROM patients WHERE race=p.race) DESC,
+ p.race,
+ CASE WHEN p.gender='M' THEN 0
+ WHEN p.gender='F' THEN 1
+ ELSE 2
+ END
+
+
+```
+
+**Smoking Status**
+
+-   The patient distribution related to smoking status is described as below.
+    -   The smoking ratio among asthma cohort patient group is 87%.
+
+```{sql connection=con}
+SELECT (COUNT(DISTINCT (a.patient))*100)/(SELECT COUNT(*) FROM asthmaCohort) AS smoking_ratio
+FROM asthmaCohort AS a
+INNER JOIN
+observations AS o
+ON a.patient=o.patient
+INNER JOIN
+careplans AS c
+ON a.patient=c.patient
+WHERE o.code='72166-2' AND (c.stop IS NULL OR c.stop >='2022-01-01')
+```
+
+**Insurance Status**
+
+-   The patient distribution related to insurance status is described as below. (no-insurance id = e03e23c9-4df1-3eb6-a62d-f70f02301496)
+    -   Approximately 11% patients were not in any insurance plans in year 2022.
+
+```{sql connection=con}
+SELECT p.name AS insurance_name, COUNT(a.patient) AS number_of_patients, (COUNT(a.patient)*100)/(SELECT COUNT(*) FROM asthmaCohort) AS ratio
+FROM asthmaCohort AS a
+INNER JOIN
+payer_transitions AS pt
+ON a.patient=pt.patient
+INNER JOIN 
+payers AS p
+ON p.id=pt.payer
+WHERE pt.end_date>='2022-01-01'
+GROUP BY p.name
+ORDER BY (COUNT(a.patient)*100)/(SELECT COUNT(*) FROM asthmaCohort) DESC
+
+```
+
+#### 3) Asthma Patient Treatment & Care Status Analysis
+
+-   To evaluate how asthma patients were treated and/or managed since year 2022, the following analysis was conducted.
+    -   From the careplans table/description column: containing 'Asthma' or 'asthma'. --\> to see how many asthma patients have active careplans.
+    -   From the immunizations table/description column: containing 'Pneumococcal' or 'PCV'. --\> to see how many asthma patients have been immunized with pneumococcal vaccine.
+    -   From the medications table:\
+        --\> to see how many asthma patients were prescribed with asthma medications.
+
+##### 3-1) Active Careplan Status
+
+-   According to the following query, a total 1,381 patients have active careplan, which is 60% of the total asthma patient cohort.
+
+```{sql connection=con}
+SELECT COUNT(DISTINCT c.patient) AS patients_with_careplan, (COUNT(DISTINCT c.patient)*100)/(SELECT COUNT(*) FROM asthmaCohort) AS ratio
+
+FROM careplans AS c
+INNER JOIN 
+asthmaCohort AS a
+ON a.patient=c.patient
+WHERE (c.description LIKE '%asthma%' OR c.description LIKE '%Asthma%') 
+AND (c.stop IS NULL OR c.stop >='2022-01-01')
+```
+
+##### 3-2) Immunization Status
+
+-   488 patients from the asthma cohort was immunized with pneumococcal vaccine, which is 21% of the total cohort group.
+-   In particular, 57 patients from this cohort were vaccinated since the year 2021, which represents approximately 2% of this cohort.
+
+```{sql connection=con}
+WITH pcv_vaccine AS (
+SELECT i.patient, i.date
+FROM immunizations AS i
+INNER JOIN
+asthmaCohort AS a
+ON a.patient=i.patient
+WHERE (i.description LIKE '%PCV%' OR i.description LIKE '%Pneumococcal%')
+)
+SELECT COUNT(DISTINCT patient) AS immunized_patient, (COUNT(DISTINCT patient)*100)/(SELECT COUNT(*) FROM asthmaCohort) AS immunized_ratio, (SELECT(COUNT(DISTINCT pcv_vaccine.patient)) FROM pcv_vaccine WHERE date >='2021-01-01') AS immunized_since_2021, ((SELECT(COUNT(DISTINCT pcv_vaccine.patient)) FROM pcv_vaccine WHERE date >='2021-01-01')*100)/(SELECT COUNT(*) FROM asthmaCohort) AS immunized_since2021_ratio
+FROM pcv_vaccine
+
+```
+
+##### 3-3) Medication Status
+
+-   A total of 1591 patients had medications prescribed related to asthma control (rescue inhaler & maintenance inhaler), representing 69% of the total cohort.
+-   All patients who had maintenance inhaler were also prescribed with rescue inhalers. (The number of patients with maintenance inhaler without the rescue inhaler was 0.)
+-   Patients who had prescription with the stop date after 2022-01-1 were included in this description.
+
+```{sql connection=con}
+WITH maintenance_med AS (
+SELECT m.code, m.description, m.patient
+FROM medications AS m
+INNER JOIN asthmaCohort AS a
+ON a.patient=m.patient
+WHERE code IN (95996, 349094, 616830, 1998774, 896209, 896006, 966529, 746815, 966524, 1547660, 1998772, 1536144) AND stop >='2022-01-01'
+), 
+rescue_med AS (
+SELECT r.code, r.description, r.patient 
+FROM medications AS r
+INNER JOIN asthmaCohort AS a
+ON a.patient=r.patient
+WHERE code IN (630208, 859088, 745752, 351137, 351136, 245314, 2123111, 746763) AND stop >='2022-01-01'
+)
+
+SELECT 'maintenance_medication' AS medication_type, COUNT(DISTINCT m.patient) AS patient_count, (COUNT(DISTINCT m.patient)*100)/(SELECT COUNT(*) FROM asthmaCohort) AS ratio
+FROM maintenance_med AS m
+
+UNION
+
+SELECT 'rescue_medication' AS medication_type, COUNT(DISTINCT r.patient) AS patient_count, (COUNT(DISTINCT r.patient)*100)/(SELECT COUNT(*) FROM asthmaCohort) AS ratio
+FROM rescue_med AS r
+
+UNION 
+
+SELECT 'both_medication' AS medication_type, COUNT(DISTINCT m.patient) AS patient_count, (COUNT(DISTINCT m.patient)*100)/(SELECT COUNT(*) FROM asthmaCohort) AS ratio
+FROM maintenance_med AS m
+WHERE m.patient IN(
+SELECT DISTINCT r.patient
+FROM rescue_med AS r
+)
+
+```
+
+-   From the maintenance inhaler medication, '60 ACTUAT Fluticasone propionate 0.25 MG/ACTUAT / salmeterol 0.05 MG/ACTUAT Dry Powder Inhaler' was the most prescribed medication.
+
+```{sql connection=con}
+WITH maintenance_med AS (
+SELECT m.code, m.description, m.patient
+FROM medications AS m
+INNER JOIN asthmaCohort AS a
+ON a.patient=m.patient
+WHERE code IN (95996, 349094, 616830, 1998774, 896209, 896006, 966529, 746815, 966524, 1547660, 1998772, 1536144) AND stop >='2022-01-01'
+)
+
+SELECT description, COUNT(DISTINCT patient) AS number_of_patient FROM maintenance_med
+WHERE patient IN (SELECT * FROM asthmaCohort)
+GROUP BY description
+ORDER BY COUNT(DISTINCT patient) DESC
+```
+
+-   From the rescue inhaler medication, 'albuterol 0.83 MG/ML Inhalation Solution' was the most prescribed medication.
+
+```{sql connection=con}
+WITH rescue_med AS (
+SELECT r.code, r.description, r.patient 
+FROM medications AS r
+INNER JOIN asthmaCohort AS a
+ON a.patient=r.patient
+WHERE code IN (630208, 859088, 745752, 351137, 351136, 245314, 2123111, 746763) AND stop >='2022-01-01'
+)
+
+SELECT description, COUNT(DISTINCT patient) AS number_of_patient 
+FROM rescue_med
+WHERE patient IN (SELECT * FROM asthmaCohort)
+GROUP BY description
+ORDER BY COUNT(DISTINCT patient) DESC
+```
+
+#### 4) Severity of Asthma Condition
+
+-   In order to evaluate the severity of each patients from the asthma cohort, the number of encounters during year 2022 was calculated as below.
+-   The higher the number of encounters related to asthma could indicate that the patient is more severe with the asthma condition.
+
+```{sql connection=con}
+SELECT e.patient, COUNT(e.description) AS number_of_encounters
+FROM encounters AS e
+WHERE (e.start BETWEEN '2022-01-01' AND '2022-12-31') AND (e.patient IN (SELECT * FROM asthmaCohort)) AND (reasondescription LIKE '%Asthma%' OR reasondescription LIKE '%asthma%')
+GROUP by patient
+ORDER BY COUNT(e.description) DESC
+
+
+```
+
+## IV. Results & Summary
+
+-   Analyses were conducted to study the asthma managment status in year 2022.
+-   The patient cohort was defined as patients with history of asthma-related encounters or medications in year 2022.
+-   The average age of this patient cohort was 45, and male/female ratio were similar (46% & 52%).
+-   Approximately 11% of these patients did not have insurance.
+-   60% of them had active careplans regarding asthma management.
+-   21% of the patient group were immunized with PCV vaccine at least once in the past, and only 2% of theme were vaccinated since year 2021.
+-   69% of patients had medications regarding asthma inhalers.
